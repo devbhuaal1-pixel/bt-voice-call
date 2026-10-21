@@ -1,0 +1,476 @@
+name: Build BT Voice Call APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Generate Complete Android Project Files
+        run: |
+          mkdir -p app/src/main/java/com/example/btvoicecall
+
+          cat << 'EOF' > settings.gradle
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "BTVoiceCall"
+          include(":app")
+          EOF
+
+          cat << 'EOF' > build.gradle
+          plugins {
+              id 'com.android.application' version '8.4.0' apply false
+              id 'org.jetbrains.kotlin.android' version '1.9.24' apply false
+          }
+          EOF
+
+          cat << 'EOF' > app/build.gradle
+          plugins {
+              id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
+          }
+
+          android {
+              namespace 'com.example.btvoicecall'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId "com.example.btvoicecall"
+                  minSdk 23
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = '17'
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+              <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+              <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="30" />
+              <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+              <uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation" />
+              <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+
+              <application
+                  android:allowBackup="true"
+                  android:label="BT Voice Call"
+                  android:supportsRtl="true"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="portrait">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/example/btvoicecall/MainActivity.kt
+          package com.example.btvoicecall
+
+          import android.Manifest
+          import android.annotation.SuppressLint
+          import android.app.Activity
+          import android.bluetooth.BluetoothAdapter
+          import android.bluetooth.BluetoothDevice
+          import android.bluetooth.BluetoothManager
+          import android.bluetooth.BluetoothServerSocket
+          import android.bluetooth.BluetoothSocket
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.media.AudioAttributes
+          import android.media.AudioFormat
+          import android.media.AudioManager
+          import android.media.AudioRecord
+          import android.media.AudioTrack
+          import android.media.MediaRecorder
+          import android.media.audiofx.AcousticEchoCanceler
+          import android.media.audiofx.NoiseSuppressor
+          import android.os.Build
+          import android.os.Bundle
+          import android.view.Gravity
+          import android.widget.ArrayAdapter
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ListView
+          import android.widget.TextView
+          import java.io.IOException
+          import java.util.UUID
+          import kotlin.concurrent.thread
+
+          @SuppressLint("MissingPermission")
+          class MainActivity : Activity() {
+
+              companion object {
+                  private val APP_UUID: UUID = UUID.fromString("8ce255c0-200a-11e0-ac64-0800200c9a66")
+                  private const val SERVICE_NAME = "BTVoiceCallService"
+                  private const val SAMPLE_RATE = 8000
+                  private const val FRAME_SIZE = 320
+              }
+
+              private var bluetoothAdapter: BluetoothAdapter? = null
+              private var serverSocket: BluetoothServerSocket? = null
+              private var activeSocket: BluetoothSocket? = null
+
+              @Volatile private var isCallActive = false
+              @Volatile private var isMuted = false
+              @Volatile private var isListeningForCalls = false
+              private var isSpeakerOn = false
+
+              private lateinit var statusText: TextView
+              private lateinit var btnDiscoverable: Button
+              private lateinit var btnRefreshDevices: Button
+              private lateinit var btnMute: Button
+              private lateinit var btnSpeaker: Button
+              private lateinit var btnHangUp: Button
+              private lateinit var deviceListView: ListView
+
+              private val pairedDevicesList = mutableListOf<BluetoothDevice>()
+              private lateinit var listAdapter: ArrayAdapter<String>
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setupUI()
+
+                  val btManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+                  bluetoothAdapter = btManager.adapter
+
+                  if (bluetoothAdapter == null) {
+                      statusText.text = "Error: Bluetooth not supported on this device."
+                      return
+                  }
+                  requestRequiredPermissions()
+              }
+
+              private fun setupUI() {
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(48, 64, 48, 48)
+                      setBackgroundColor(Color.parseColor("#121212"))
+                  }
+
+                  val title = TextView(this).apply {
+                      text = "Offline Bluetooth Voice Call"
+                      textSize = 22f
+                      setTypeface(null, Typeface.BOLD)
+                      setTextColor(Color.WHITE)
+                      gravity = Gravity.CENTER
+                      setPadding(0, 0, 0, 24)
+                  }
+                  root.addView(title)
+
+                  statusText = TextView(this).apply {
+                      text = "Status: Initializing..."
+                      textSize = 16f
+                      setTextColor(Color.parseColor("#4CAF50"))
+                      gravity = Gravity.CENTER
+                      setPadding(24, 24, 24, 36)
+                  }
+                  root.addView(statusText)
+
+                  btnDiscoverable = Button(this).apply {
+                      text = "1. Make Phone Discoverable"
+                      setOnClickListener { makeDiscoverable() }
+                  }
+                  root.addView(btnDiscoverable)
+
+                  btnRefreshDevices = Button(this).apply {
+                      text = "2. Refresh Paired Phones List"
+                      setOnClickListener { loadPairedDevices() }
+                  }
+                  root.addView(btnRefreshDevices)
+
+                  val listLabel = TextView(this).apply {
+                      text = "Tap a Paired Phone Below to Call:"
+                      setTextColor(Color.LTGRAY)
+                      setPadding(0, 24, 0, 12)
+                  }
+                  root.addView(listLabel)
+
+                  deviceListView = ListView(this).apply {
+                      layoutParams = LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
+                      )
+                      setBackgroundColor(Color.parseColor("#1E1E1E"))
+                  }
+                  listAdapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, mutableListOf())
+                  deviceListView.adapter = listAdapter
+                  deviceListView.setOnItemClickListener { _, _, position, _ ->
+                      if (!isCallActive && position < pairedDevicesList.size) {
+                          connectToDevice(pairedDevicesList[position])
+                      }
+                  }
+                  root.addView(deviceListView)
+
+                  val callControls = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER
+                      setPadding(0, 24, 0, 0)
+                  }
+
+                  btnMute = Button(this).apply {
+                      text = "Mute Mic"
+                      isEnabled = false
+                      setOnClickListener { toggleMute() }
+                  }
+                  callControls.addView(btnMute)
+
+                  btnSpeaker = Button(this).apply {
+                      text = "Speaker: OFF"
+                      isEnabled = false
+                      setOnClickListener { toggleSpeaker() }
+                  }
+                  callControls.addView(btnSpeaker)
+
+                  btnHangUp = Button(this).apply {
+                      text = "End Call"
+                      isEnabled = false
+                      setBackgroundColor(Color.parseColor("#D32F2F"))
+                      setTextColor(Color.WHITE)
+                      setOnClickListener { endCall() }
+                  }
+                  callControls.addView(btnHangUp)
+
+                  root.addView(callControls)
+                  setContentView(root)
+              }
+
+              private fun requestRequiredPermissions() {
+                  val permissions = mutableListOf(Manifest.permission.RECORD_AUDIO)
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                      permissions.add(Manifest.permission.BLUETOOTH_CONNECT)
+                      permissions.add(Manifest.permission.BLUETOOTH_SCAN)
+                      permissions.add(Manifest.permission.BLUETOOTH_ADVERTISE)
+                  } else {
+                      permissions.add(Manifest.permission.ACCESS_FINE_LOCATION)
+                  }
+
+                  val needed = permissions.filter {
+                      checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED
+                  }
+
+                  if (needed.isNotEmpty()) {
+                      requestPermissions(needed.toTypedArray(), 101)
+                  } else {
+                      startBluetoothServices()
+                  }
+              }
+
+              override fun onRequestPermissionsResult(
+                  requestCode: Int,
+                  permissions: Array<out String>,
+                  grantResults: IntArray
+              ) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+                  if (grantResults.all { it == PackageManager.PERMISSION_GRANTED }) {
+                      startBluetoothServices()
+                  } else {
+                      statusText.text = "Permissions required for Bluetooth & Voice."
+                  }
+              }
+
+              private fun startBluetoothServices() {
+                  if (bluetoothAdapter?.isEnabled == false) {
+                      startActivityForResult(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE), 102)
+                  }
+                  loadPairedDevices()
+                  startIncomingCallServer()
+              }
+
+              private fun makeDiscoverable() {
+                  val discoverableIntent = Intent(BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE).apply {
+                      putExtra(BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, 300)
+                  }
+                  startActivity(discoverableIntent)
+              }
+
+              private fun loadPairedDevices() {
+                  pairedDevicesList.clear()
+                  listAdapter.clear()
+                  val bonded = bluetoothAdapter?.bondedDevices ?: emptySet()
+                  for (device in bonded) {
+                      pairedDevicesList.add(device)
+                      listAdapter.add("${device.name ?: "Unknown Device"}\n${device.address}")
+                  }
+                  listAdapter.notifyDataSetChanged()
+              }
+
+              private fun startIncomingCallServer() {
+                  if (isListeningForCalls) return
+                  isListeningForCalls = true
+                  updateStatus("Ready & Waiting for Incoming Calls...")
+
+                  thread(start = true) {
+                      try {
+                          serverSocket = bluetoothAdapter?.listenUsingRfcommWithServiceRecord(SERVICE_NAME, APP_UUID)
+                          while (isListeningForCalls) {
+                              val socket = serverSocket?.accept()
+                              if (socket != null) {
+                                  if (isCallActive) {
+                                      socket.close()
+                                  } else {
+                                      activeSocket = socket
+                                      val callerName = socket.remoteDevice.name ?: "Remote Phone"
+                                      startVoiceCallSession(callerName)
+                                  }
+                              }
+                          }
+                      } catch (e: IOException) {
+                          isListeningForCalls = false
+                      }
+                  }
+              }
+
+              private fun connectToDevice(device: BluetoothDevice) {
+                  updateStatus("Calling ${device.name ?: device.address}...")
+                  thread(start = true) {
+                      try {
+                          bluetoothAdapter?.cancelDiscovery()
+                          val socket = device.createRfcommSocketToServiceRecord(APP_UUID)
+                          socket.connect()
+                          activeSocket = socket
+                          startVoiceCallSession(device.name ?: "Remote Phone")
+                      } catch (e: IOException) {
+                          updateStatus("Call failed: Open app on the other phone first.")
+                      }
+                  }
+              }
+
+              private fun startVoiceCallSession(peerName: String) {
+                  isCallActive = true
+                  isMuted = false
+
+                  runOnUiThread {
+                      statusText.text = "IN CALL WITH: $peerName"
+                      statusText.setTextColor(Color.parseColor("#00E676"))
+                      btnMute.isEnabled = true
+                      btnSpeaker.isEnabled = true
+                      btnHangUp.isEnabled = true
+                      deviceListView.isEnabled = false
+                  }
+
+                  val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                  audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+                  audioManager.isSpeakerphoneOn = isSpeakerOn
+
+                  thread(start = true) {
+                      android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
+                      val minBuf = AudioRecord.getMinBufferSize(
+                          SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
+                      ).coerceAtLeast(FRAME_SIZE * 2)
+
+                      val recorder = AudioRecord(
+                          MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+                          SAMPLE_RATE,
+                          AudioFormat.CHANNEL_IN_MONO,
+                          AudioFormat.ENCODING_PCM_16BIT,
+                          minBuf
+                      )
+
+                      if (AcousticEchoCanceler.isAvailable()) {
+                          AcousticEchoCanceler.create(recorder.audioSessionId)?.enabled = true
+                      }
+                      if (NoiseSuppressor.isAvailable()) {
+                          NoiseSuppressor.create(recorder.audioSessionId)?.enabled = true
+                      }
+
+                      val buffer = ByteArray(FRAME_SIZE)
+                      val outStream = activeSocket?.outputStream
+
+                      try {
+                          recorder.startRecording()
+                          while (isCallActive && activeSocket?.isConnected == true) {
+                              val read = recorder.read(buffer, 0, buffer.size)
+                              if (read > 0 && !isMuted) {
+                                  outStream?.write(buffer, 0, read)
+                              }
+                          }
+                      } catch (_: IOException) {
+                      } finally {
+                          try {
+                              recorder.stop()
+                              recorder.release()
+                          } catch (_: Exception) {}
+                          endCall()
+                      }
+                  }
+
+                  thread(start = true) {
+                      android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
+                      val minBuf = AudioTrack.getMinBufferSize(
+                          SAMPLE_RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT
+                      ).coerceAtLeast(FRAME_SIZE * 2)
+
+                      val track = AudioTrack.Builder()
+                          .setAudioAttributes(
+                              AudioAttributes.Builder()
+                                  .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                                  .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                                  .build()
+                          )
+                          .setAudioFormat(
+                              AudioFormat.Builder()
+                                  .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                                  .setSampleRate(SAMPLE_RATE)
+                                  .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                                  .build()
+                          )
+                          .setBufferSizeInBytes(minBuf)
+                          .setTransferMode(AudioTrack.MODE_STREAM)
+                          .build()
+
+                      val buffer = B
